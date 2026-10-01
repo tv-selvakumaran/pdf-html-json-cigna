@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from extractor import extract_paragraph_lines, BULLET_CHARS   # noqa: F401
+from cigna_extractor import extract_paragraph_lines, BULLET_CHARS   # noqa: F401
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -48,13 +48,22 @@ class BulletItem:
 class RomanItem:
     text: str
     children: list = field(default_factory=list)   # list[NoteItem]
+    notes: list = field(default_factory=list)        # list[NoteItem]
     kind: str = 'roman'
 
 @dataclass
 class LetterItem:
     text: str
     children: list = field(default_factory=list)   # list[RomanItem]
+    notes: list = field(default_factory=list)       # list[NoteItem]
     kind: str = 'letter'
+
+@dataclass
+class ParenNumItem:
+    text: str
+    children: list = field(default_factory=list)
+    notes: list = field(default_factory=list)   
+    kind: str = 'paren_num'
 
 @dataclass
 class NoteItem:
@@ -65,13 +74,22 @@ class NoteItem:
 class NumItem:
     text: str
     children: list = field(default_factory=list)   # list[LetterItem]
+    notes: list = field(default_factory=list)       # list[NoteItem]
+    epilogue: list = field(default_factory=list) 
     kind: str = 'num'
+    number: int | None = None
 
 @dataclass
 class ParagraphBlock:
     plain_text: str = ''
     items: list = field(default_factory=list)
     kind: str = 'paragraph_block'
+
+@dataclass
+class EpilogueSection:
+    heading: str
+    content: str = ''
+    kind: str = 'epilogue'
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -102,15 +120,68 @@ def _is_any_marker(l: dict) -> bool:
             _is_sub_marker(l) or _is_subsub_marker(l))
 
 def _is_num(l: dict) -> bool:
-    return l['x0'] <= 65 and bool(re.match(r'^\d+\.', l['text']))
+    if l['x0'] > 75:
+        return False
+    _m = re.match(r'^(\d+)[.)]', l['text'])
+    if not _m:
+        return False
+    _digits = _m.group(1)
+    # Exclude 4-digit sequences (years, e.g. "2022)") -- a genuine
+    # numbered-list marker is realistically 1-3 digits; a 4-digit
+    # number immediately followed by '.' or ')' is virtually always a
+    # year appearing parenthetically in prose, not a list item.
+    if len(_digits) >= 4:
+        return False
+    return True
 
-def _is_roman(l: dict) -> bool:
-    """Roman numeral sub-items: i. ii. iii. etc. at x=85-100"""
-    return (85 <= l['x0'] <= 100 and
-            bool(re.match(r'^[ivxIVX]+\.\s', l['text'])))
+def _is_nested_num_fallback(l: dict) -> bool:
+    """Interim fallback: a numbered marker (1. 2. 3.) at ANY indentation,
+    used only when nothing else in the marker chain matched. This covers
+    numbered sub-lists nested deeper than the fixed x0 bands anticipate
+    (e.g. num -> letter -> roman -> num), without touching the existing
+    absolute-x0 detectors and their tuned ranges."""
+    return bool(re.match(r'^\d+[.)]\s', l['text']))
 
 def _is_letter(l: dict) -> bool:
-    return 68 <= l['x0'] <= 78 and bool(re.match(r'^[A-E]\)', l['text']))
+    if not (60 <= l['x0'] <= 115):
+        return False
+    _m = re.match(r'^([A-Z])[.)]', l['text'])
+    if not _m:
+        return False
+    _after_marker = l['text'][_m.end():].strip()
+    # A genuine lettered item always has real content following the
+    # marker on the same line. A bare marker with nothing (or only a
+    # colon/punctuation) after it -- e.g. "D):" -- is a tail fragment
+    # of a preceding sentence listing upcoming sub-items, not an
+    # actual lettered item.
+    if not _after_marker or not _after_marker[0].isalnum():
+        return False
+    return True
+
+
+def _is_roman_old(l: dict) -> bool:
+    """Roman numeral sub-items: i. ii. iii. etc. at x=84-128"""
+    return (84 <= l['x0'] <= 156 and
+            bool(re.match(r'^[ivxIVX]+[.)]\s', l['text'])))
+
+def _is_roman(l: dict, is_cpg: bool = False) -> bool:
+    """Roman numeral sub-items: i. ii. iii. etc. at x=84-128 (nested),
+    or x=54-84 for cpg-family documents, which use top-level roman
+    numeral lists with a narrower left margin than other families."""
+    _x0_ok = (84 <= l['x0'] <= 156) or (is_cpg and 54 <= l['x0'] <= 84)
+    return (_x0_ok and
+            bool(re.match(r'^[ivxIVX]+[.)]\s', l['text'])))
+
+
+def _is_paren_num(l: dict) -> bool:
+    """Parenthesized numeral sub-items: (1) (2) etc. — a 4th-tier marker
+    nested under roman items, e.g. num -> letter -> roman -> paren_num."""
+    _m = re.match(r'^\((\d+)\)', l['text'])
+    if not _m:
+        return False
+    if len(_m.group(1)) >= 4:
+        return False  # excludes years like (2024)
+    return True
 
 def _is_note(l: dict) -> bool:
     return l['text'].startswith('Note:') or l['text'].startswith('Note :')
@@ -123,24 +194,34 @@ def _clean(t: str) -> str:
 # Main reconstruction
 # ════════════════════════════════════════════════════════════════════════════
 
-def reconstruct(lines: list[dict]) -> ParagraphBlock:
+
+def _resolve_entries(lines: list[dict], is_cpg: bool = False) -> list[tuple]:
     """
-    Build a ParagraphBlock from pre-extracted paragraph lines.
     Pass 1: resolve markers to adjacent text.
-    Pass 2: build typed hierarchy.
+    Returns sorted list of (page, y, etype, text, x0, size) tuples.
     """
+
+    from cigna_constants import FOOTER_PATTERNS
+    # Filter page footer lines before processing
+    lines = [l for l in lines 
+             if not any(p.match(l['text'].strip()) for p in FOOTER_PATTERNS)]
     if not lines:
-        return ParagraphBlock()
+        return []
 
     sl = sorted(lines, key=lambda l: (l.get('_page', 0), l['top']))
     n  = len(sl)
     claimed      = set()
     pre_resolved = set()
-    entries      = []      # (y, etype, text, x0)
+    entries      = []
 
     # ── Pass 1 ───────────────────────────────────────────────────────────
     for i, line in enumerate(sl):
+        if i in claimed or i in pre_resolved:
+            continue
         y = line['top']
+        size = line.get('size', 10.0) # ← add this once
+        bold = line.get('bold', False)
+        underline = line.get('underline', False)
 
         mtype_tag = line.get('marker_type')
         if mtype_tag:
@@ -167,7 +248,8 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
                             text_val = text_val.strip() + sl[j]['text']
                             claimed.add(j)
                             break
-            entries.append((line.get('_page', 0), y, mtype_tag, text_val, x0_val))
+            entries.append((line.get('_page', 0), y, mtype_tag, text_val, x0_val, size, bold, underline, 
+                            line.get('leading_bold', False), line.get('italic', False)))
             pre_resolved.add(i)
             continue
 
@@ -176,10 +258,13 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
                 if 0 <= j < n and j not in claimed and not _is_any_marker(sl[j]):
                     if abs(sl[j]['top'] - y) <= 8:
                         claimed.add(j)
-                        entries.append((line.get('_page',0), y, 'bullet', sl[j]['text'], line['x0']))
+                        entries.append((line.get('_page',0), y, 'bullet', sl[j]['text'], 
+                                        line['x0'], size, bold, underline, 
+                                        line.get('leading_bold', False), line.get('italic', False)))
                         break
             else:
-                entries.append((line.get('_page',0), y, 'bullet', '', line['x0']))
+                entries.append((line.get('_page',0), y, 'bullet', '', line['x0'], size, 
+                                bold, underline, line.get('leading_bold', False), line.get('italic', False)))
 
         elif _is_bold_bullet(line):
             own = line['text'].lstrip('•\u2022 ').strip()
@@ -196,7 +281,8 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
                             own = (own + nxt['text']).strip()
                             claimed.add(j)
                             break
-            entries.append((line.get('_page',0), y, 'bullet', own, line['x0']))
+            entries.append((line.get('_page',0), y, 'bullet', own, line['x0'], size, bold, underline, 
+                            line.get('leading_bold', False), line.get('italic', False)))
 
         elif _is_sub_marker(line):
             found = False
@@ -204,11 +290,14 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
                 if 0 <= j < n and j not in claimed and not _is_any_marker(sl[j]):
                     if abs(sl[j]['top'] - y) <= 8:
                         claimed.add(j)
-                        entries.append((line.get('_page',0), y, 'sub', sl[j]['text'], sl[j]['x0']))
+                        entries.append((line.get('_page',0), y, 'sub', 
+                                        sl[j]['text'], sl[j]['x0'], size, bold, underline, 
+                                        line.get('leading_bold', False), line.get('italic', False)))
                         found = True
                         break
             if not found:
-                entries.append((line.get('_page',0), y, 'sub', '', line['x0']))
+                entries.append((line.get('_page',0), y, 'sub', '', line['x0'], size, bold, underline, 
+                                line.get('leading_bold', False), line.get('italic', False)))
 
         elif _is_subsub_marker(line):
             found = False
@@ -216,16 +305,20 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
                 if 0 <= j < n and j not in claimed and not _is_any_marker(sl[j]):
                     if abs(sl[j]['top'] - y) <= 8:
                         claimed.add(j)
-                        entries.append((line.get('_page',0), y, 'subsub', sl[j]['text'], sl[j]['x0']))
+                        entries.append((line.get('_page',0), y, 'subsub', sl[j]['text'], 
+                                        sl[j]['x0'], size, bold, underline, 
+                                        line.get('leading_bold', False), line.get('italic', False)))
                         found = True
                         break
             if not found:
-                entries.append((line.get('_page',0), y, 'subsub', '', line['x0']))
+                entries.append((line.get('_page',0), y, 'subsub', '', line['x0'], size, bold, underline, 
+                                line.get('leading_bold', False), line.get('italic', False)))
 
         elif _is_note(line):
             # Collect all continuation lines belonging to this note
             # before creating the entry — prevents fragmentation
             note_text = line['text']
+            note_x0 = line['x0']
             last_was_num = False
             j = i + 1
             while j < len(sl):
@@ -237,9 +330,11 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
                 if (_is_any_marker(nxt) or
                         _is_num(nxt) or _is_note(nxt) or
                         _is_roman(nxt) or _is_letter(nxt) or
-                        nxt.get('bold') or
+                        _is_paren_num(nxt) or 
+                        nxt.get('leading_bold') or
                         nxt.get('size', 0) >= 12.0 or
-                        nxt.get('in_table')):
+                        nxt.get('in_table') or 
+                        nxt.get('x0', note_x0) < note_x0 - 2):
                     break
                 nxt_text = nxt['text'].strip()
                 # Numbered item within note — separate with <br>
@@ -256,20 +351,47 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
                     last_was_num = False
                 claimed.add(j)
                 j += 1
-            entries.append((line.get('_page', 0), y, 'note',
-                            note_text, line['x0']))
+            entries.append((line.get('_page', 0), y, 'note', note_text, line['x0'], size, bold, 
+                            underline, line.get('leading_bold', False), line.get('italic', False)))
 
         elif _is_num(line):
-            entries.append((line.get('_page',0), y, 'num', line['text'], line['x0']))
+            entries.append((line.get('_page',0), y, 'num', line['text'], line['x0'], size, bold, 
+                            underline, line.get('leading_bold', False), line.get('italic', False)))
 
-        elif _is_note(line):
-            entries.append((line.get('_page',0), y, 'note', line['text'], line['x0']))
-
-        elif _is_roman(line):
-            entries.append((line.get('_page',0), y, 'roman', line['text'], line['x0']))
+        elif _is_roman(line, is_cpg=is_cpg):
+            entries.append((line.get('_page',0), y, 'roman', line['text'], line['x0'], size, bold, 
+                            underline, line.get('leading_bold', False), line.get('italic', False)))
 
         elif _is_letter(line):
-            entries.append((line.get('_page',0), y, 'letter', line['text'], line['x0']))
+            _letter_match = re.match(r'^([A-Z])[.)]', line['text'].strip())
+            _is_ambiguous_i = bool(_letter_match and _letter_match.group(1) == 'I')
+            _etype = 'letter'
+            if _is_ambiguous_i:
+                # Peek ahead for a sibling at the same x0: if it looks like
+                # "II."/"III."/"IV." (roman continuation) rather than "B."
+                # (letter continuation), this "I." is a top-level roman
+                # numeral, not a nested letter marker.
+                for j in range(i + 1, len(sl)):
+                    if j in claimed or j in pre_resolved:
+                        continue
+                    _nxt = sl[j]
+                    if abs(_nxt['x0'] - line['x0']) > 3.0:
+                        continue
+                    _nxt_text = _nxt['text'].strip()
+                    if re.match(r'^(II|III|IV|V)[.)]', _nxt_text):
+                        _etype = 'roman'
+                    break
+            entries.append((line.get('_page', 0), y, _etype, line['text'], line['x0'], size, bold,
+                            underline, line.get('leading_bold', False), line.get('italic', False)))
+
+        elif _is_paren_num(line):
+            entries.append((line.get('_page',0), y, 'paren_num', line['text'],
+                             line['x0'], size, bold, underline, 
+                             line.get('leading_bold', False), line.get('italic', False)))
+        elif _is_nested_num_fallback(line):
+            entries.append((line.get('_page',0), y, 'num', line['text'],
+                             line['x0'], size, bold, underline, 
+                             line.get('leading_bold', False), line.get('italic', False)))
 
     # ── Collect unclaimed plain/continuation lines ────────────────────────
     for i, line in enumerate(sl):
@@ -277,23 +399,46 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
             continue
         if (not _is_any_marker(line) and not line.get('marker_type') and
                 not _is_num(line) and not _is_note(line) and
-                not _is_roman(line) and not _is_letter(line)):
-            entries.append((line.get('_page',0), line['top'], 'plain', line['text'], line['x0']))
+                not _is_roman(line, is_cpg=is_cpg) and not _is_letter(line) and
+                not _is_paren_num(line)):
+            _size         = line.get('size', 10.0)
+            _bold         = line.get('bold', False)
+            _underline    = line.get('underline', False)
+            _leading_bold = line.get('leading_bold', False)
+            entries.append((line.get('_page',0), line['top'], 'plain', 
+                            line['text'], line['x0'], _size, _bold, _underline, 
+                            _leading_bold, line.get('italic', False)))
 
     entries.sort(key=lambda e: (e[0], e[1]))  # sort by (page, y)
+    return entries
+
+
+def _build_block(entries: list[tuple], citation_numbers: dict = None) -> ParagraphBlock:
+    """
+    Pass 2: build typed hierarchy from entries.
+    Returns ParagraphBlock.
+    """
+    citation_numbers = citation_numbers or {}
 
     # ── Pass 2 ───────────────────────────────────────────────────────────
     block          = ParagraphBlock()
-    current_bullet : Optional[BulletItem]    = None
-    current_sub    : Optional[SubBulletItem] = None
-    current_num    : Optional[NumItem]       = None
-    current_letter : Optional[LetterItem]    = None
-    current_roman  : Optional[RomanItem]     = None
-    current_note   : Optional[NoteItem]      = None
-    current_bullet_x0: float = 0.0
-    current_bullet_pg: int = 0
+    current_bullet          : Optional[BulletItem]      = None
+    current_sub             : Optional[SubBulletItem]   = None
+    current_num             : Optional[NumItem]         = None
+    current_num_x0          : float                     = 0.0
+    current_num_pg          : int                       = 0
+    current_letter          : Optional[LetterItem]      = None
+    current_roman           : Optional[RomanItem]       = None
+    current_paren_num       : Optional[ParenNumItem]    = None
+    current_note            : Optional[NoteItem]        = None
+    current_note_x0         : float                     = 0.0
+    current_note_pg         : int                       = 0
+    current_epilogue        : Optional[EpilogueSection] = None
+    current_letter_child_x0 : Optional[float]           = None
+    current_bullet_x0       : float                     = 0.0
+    current_bullet_pg       : int                       = 0
 
-    for _pg, y, etype, text, x0 in entries:
+    for _pg, y, etype, text, x0, size, bold, underline, leading_bold, italic in entries:
         text = _clean(text)
 
         if etype == 'bullet':
@@ -319,35 +464,60 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
         elif etype in ('subsub', 'sub_sub_bullet'):
             current_roman = None
             current_note  = None
-            if current_sub is not None:
+            from reconstruct_cigna_bullet import SubBulletItem as _SBI
+            if current_sub is not None and not isinstance(current_sub, SubBulletItem):
+                # current_sub is a real SubItem — append SubSubItem as child
                 current_sub.children.append(SubSubItem(text=text))
             elif current_bullet is not None:
                 sb = SubBulletItem(text=text)
                 current_bullet.children.append(sb)
+                current_sub = sb
             else:
                 block.items.append(PlainText(text=text))
 
         elif etype == 'num':
-            current_num    = NumItem(text=text)
-            current_bullet = None
-            current_sub    = None
-            current_letter = None
-            current_roman  = None
-            current_note   = None
-            block.items.append(current_num)
+            _num_value = citation_numbers.get((_pg, y))
+            current_num_x0          = x0
+            current_num_pg          = _pg
+            current_bullet          = None
+            _is_nested_under_roman = (
+                current_roman is not None and 
+                (x0 > current_letter_child_x0 - 3 if current_letter_child_x0 else False))
+            current_letter_child_x0 = None
+            if _is_nested_under_roman:
+                nested = ParenNumItem(text=text)  
+                current_roman.children.append(nested)
+                current_paren_num = nested
+                current_num = NumItem(text=text, number=_num_value)
+            else:
+                current_num             = NumItem(text=text, number=_num_value)
+                current_bullet          = None
+                current_sub             = None
+                current_letter          = None
+                current_roman           = None
+                current_note            = None
+                current_epilogue        = None
+                current_paren_num       = None
+                block.items.append(current_num)
 
         elif etype == 'letter':
-            current_letter = LetterItem(text=text)
-            current_roman  = None
-            current_note   = None
+            current_letter          = LetterItem(text=text)
+            current_roman           = None
+            current_note            = None
+            current_epilogue        = None
+            current_letter_child_x0 = None
+            current_paren_num       = None
             if current_num is not None:
                 current_num.children.append(current_letter)
             else:
                 block.items.append(PlainText(text=text))
 
         elif etype == 'roman':
-            current_roman = RomanItem(text=text)
-            current_note  = None
+            current_roman           = RomanItem(text=text)
+            current_note            = None
+            current_epilogue        = None
+            current_paren_num       = None
+            current_letter_child_x0 = x0
             if current_letter is not None:
                 current_letter.children.append(current_roman)
             elif current_num is not None:
@@ -355,21 +525,46 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
                 if current_num.children:
                     current_num.children[-1].children.append(current_roman)
                 else:
-                    block.items.append(PlainText(text=text))
+                    block.items.append(current_roman)
             else:
-                block.items.append(PlainText(text=text))
+                block.items.append(current_roman)
+
+        elif etype == 'paren_num':
+            current_note     = None
+            current_epilogue = None
+            node = ParenNumItem(text=text)
+            if current_roman is not None:
+                current_roman.children.append(node)
+            elif current_letter is not None:
+                current_letter.children.append(node)
+            else:
+                block.items.append(node)
+            current_paren_num = node
 
         elif etype == 'note':
-            current_note = NoteItem(text=text)
-            if current_roman is not None:
+            if current_paren_num is not None:
+                current_note = NoteItem(text=text)
+                current_note_x0 = x0
+                current_note_pg = _pg
+                current_paren_num.notes.append(current_note)
+            elif current_roman is not None:
                 # Note nested inside roman item
                 current_note = NoteItem(text=text)
-                current_roman.children.append(current_note)
-                current_roman = None  # clear so continuations go to note
-            elif current_num is not None or current_letter is not None:
-                # Note nested inside num/letter context — preserve NoteItem
+                current_note_x0 = x0
+                current_note_pg = _pg
+                current_roman.notes.append(current_note)
+            elif current_letter is not None:
+                # Note nested inside letter context — preserve NoteItem
                 current_note = NoteItem(text=text)
-                block.items.append(current_note)
+                current_note_x0 = x0
+                current_note_pg = _pg
+                current_letter.notes.append(current_note)
+            elif current_num is not None:
+                # Note nested inside num context — preserve NoteItem
+                current_note = NoteItem(text=text)
+                current_note_x0 = x0
+                current_note_pg = _pg
+                current_num.notes.append(current_note)
             else:
                 # Standalone Note with no parent — treat as PlainText
                 # continuations will be picked up by the plain continuation handler
@@ -378,18 +573,62 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
         else:  # plain continuation
             if not text:
                 continue
-            if current_roman is not None:
-                # Continuation at x=108 belongs to roman item
-                current_roman.text = _clean(current_roman.text + ' ' + text)
+            _EPILOGUE_HEAD_RE = re.compile(r'^([A-Z][A-Za-z]{2,20})\s*\.\s+(\S.*)$')
+            if current_num is not None:
+                m = _EPILOGUE_HEAD_RE.match(text.strip())
+                if m and leading_bold and (current_letter_child_x0 is None or
+                          abs(x0 - current_letter_child_x0) <= 3.0):
+                    # New epilogue heading (e.g. "Dosing.") — belongs to the num item
+                    # as a whole, regardless of which letter branch (A./B.) was taken.
+                    current_letter    = None
+                    current_roman     = None
+                    current_paren_num = None
+                    current_note      = None
+                    heading = m.group(1) + '.'
+                    rest = m.group(2)
+                    current_epilogue  = EpilogueSection(heading=heading, content=rest)
+                    current_num.epilogue.append(current_epilogue)
+                    continue
+            if current_epilogue is not None:
+                current_epilogue.content = (
+                    _clean(current_epilogue.content + ' ' + text)
+                    if current_epilogue.content else text)
+            elif current_paren_num is not None:
+                current_paren_num.text = _clean(current_paren_num.text + ' ' + text)
             elif current_note is not None:
-                current_note.text = _clean(current_note.text + ' ' + text)
+                crosses_page = (_pg != current_note_pg)
+                _prev_lacks_terminal_punct = bool(
+                    current_note.text and current_note.text.rstrip() and
+                    current_note.text.rstrip()[-1] not in '.:;?!')
+                _current_starts_lowercase = bool(text and text.strip() and text.strip()[0].islower())
+                _looks_like_continuation = (crosses_page and
+                                             _prev_lacks_terminal_punct and
+                                             _current_starts_lowercase)
+
+                if crosses_page and not _looks_like_continuation and x0 < current_note_x0 + 0.5:
+                    current_note = None
+                    block.items.append(PlainText(text=text))
+                elif not crosses_page and x0 < current_note_x0 - 2:
+                    current_note = None
+                    block.items.append(PlainText(text=text))
+                else:
+                    current_note.text = _clean(current_note.text + ' ' + text)
+            elif current_roman is not None:
+                current_roman.text = _clean(current_roman.text + ' ' + text)
             elif current_sub is not None:
                 current_sub.text = (_clean(current_sub.text + ' ' + text)
                                     if current_sub.text else text)
             elif current_bullet is not None:
                 # New paragraph if: different page AND x0 is at or left of bullet marker x0
                 crosses_page = (_pg != current_bullet_pg)
-                if crosses_page and x0 < current_bullet_x0 + 0.5:
+                _prev_lacks_terminal_punct = bool(
+                    current_bullet.text and current_bullet.text.rstrip() and
+                    current_bullet.text.rstrip()[-1] not in '.:;?!')
+                _current_starts_lowercase = bool(text and text.strip() and text.strip()[0].islower())
+                _looks_like_continuation = (crosses_page and
+                                             _prev_lacks_terminal_punct and
+                                             _current_starts_lowercase)
+                if crosses_page and not _looks_like_continuation and x0 < current_bullet_x0 + 0.5:
                     current_bullet = None
                     current_sub = None
                     block.items.append(PlainText(text=text))
@@ -401,7 +640,17 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
                     current_bullet.text = (_clean(current_bullet.text + ' ' + text)
                                            if current_bullet.text else text) 
             elif current_num is not None:
-                if current_num.children:
+                crosses_page = (_pg != current_num_pg)
+                if crosses_page and x0 < current_num_x0 + 0.5:
+                    current_num = None
+                    current_letter = None
+                    block.items.append(PlainText(text=text))
+                elif not crosses_page and (x0 < current_num_x0 - 2 or 
+                                            (bold and x0 <= current_num_x0 + 2)): 
+                    current_num = None
+                    current_letter = None
+                    block.items.append(PlainText(text=text))
+                elif current_num.children:
                     li = current_num.children[-1]
                     li.text = _clean(li.text + ' ' + text) if li.text else text
                 else:
@@ -416,6 +665,14 @@ def reconstruct(lines: list[dict]) -> ParagraphBlock:
         block.items = []
 
     return block
+
+
+def reconstruct(lines: list[dict]) -> ParagraphBlock:
+    """Convenience wrapper — calls _resolve_entries then _build_block."""
+    if not lines:
+        return ParagraphBlock()
+    entries = _resolve_entries(lines)
+    return _build_block(entries)
 
 
 # ════════════════════════════════════════════════════════════════════════════

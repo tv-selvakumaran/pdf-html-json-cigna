@@ -58,11 +58,23 @@ def process_pdf(pdf_path: Path, dry_run: bool = False) -> bool:
             out = pdf_path.parent / (pdf_path.stem + '.htm')
             out.write_text(html, encoding='utf-8')
             log.info('  Written: %s', out)
+
+            # Also emit JSON alongside HTML
+            from cigna_emit_json import emit_json
+            import json
+            data = emit_json(doc)
+            json_out = pdf_path.parent / (pdf_path.stem + '.json')
+            json_out.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                encoding='utf-8')
+            log.info('  JSON:    %s', json_out)
         return True
 
     except Exception as e:
         log.error('  ERROR: %s', e)
         import traceback; traceback.print_exc()
+        return False
+
         return False
 
 

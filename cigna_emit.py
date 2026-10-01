@@ -11,7 +11,7 @@ from pathlib import Path
 from cigna_parse import (
     CignaDoc, HeaderNode, SectionNode, SubsectionNode, 
     SubSubsectionNode, ParagraphBlockNode, TableNode, 
-    FootnoteNode, IFUNode, FooterNode, 
+    FootnoteNode, IFUNode, FooterNode, ReferencesNode,
     TOCNode, RelatedResourcesNode,
 )
 from reconstruct_cigna_bullet import (
@@ -42,6 +42,16 @@ def _section_stripe(heading: str) -> str:
 def _render_paragraph_block(block: ParagraphBlock, parts: list[str],
                              in_section: str = '') -> None:
 
+    _zone = getattr(block, 'zone', None)
+    if _zone:
+        _zone_label = f"[zone: {_zone}"
+        _societies = getattr(block, 'society_names', None)
+        if _societies:
+            _zone_label += f" | societies: {', '.join(_societies)}"
+        _zone_label += "]"
+        parts.append(f'  <p style="color:#999;font-size:8pt">{_zone_label}</p>')
+
+
     if block.plain_text:
         pt = block.plain_text
         if pt.startswith('Note:') or pt.startswith('Note :'):
@@ -66,6 +76,14 @@ def _render_paragraph_block(block: ParagraphBlock, parts: list[str],
                     parts.append(
                         f'  <p style="margin-left:60px">▪ {esc(ssub.text)}</p>')
 
+        elif isinstance(item, RomanItem):
+            parts.append(
+                f'  <p style="margin-left:20px">{esc(item.text)}</p>')
+            for sub in getattr(item, 'children', []):
+                if sub.text:
+                    parts.append(
+                        f'  <p style="margin-left:40px">{esc(sub.text)}</p>')
+
         elif isinstance(item, NumItem):
             parts.append(
                 f'  <p style="margin-left:20px">{esc(item.text)}</p>')
@@ -73,26 +91,49 @@ def _render_paragraph_block(block: ParagraphBlock, parts: list[str],
             for ni in getattr(item, 'notes', []):
                 note_body = (ni.text.removeprefix('Note:')
                              .removeprefix('Note :').strip())
+                parts_note = note_body.split('<br>')
+                rendered = '<br>'.join(esc(p.strip()) for p in parts_note)
                 parts.append(
                     f'  <p style="margin-left:20px"><em>'
-                    f'<strong>Note:</strong> {esc(note_body)}</em></p>')
+                    f'<strong>Note:</strong> {rendered}</em></p>')
             for li in item.children:
                 if li.text:
                     parts.append(
                         f'  <p style="margin-left:40px">{esc(li.text)}</p>')
+                for ni in getattr(li, 'notes', []):
+                    note_body = (ni.text.removeprefix('Note:')
+                                 .removeprefix('Note :').strip())
+                    parts_note = note_body.split('<br>')
+                    rendered = '<br>'.join(esc(p.strip()) for p in parts_note)
+                    parts.append(
+                        f'  <p style="margin-left:60px"><em>'
+                        f'<strong>Note:</strong> {rendered}</em></p>')
                 for ri in li.children:
                     if ri.text:
                         parts.append(
                             f'  <p style="margin-left:60px">{esc(ri.text)}</p>')
-                    for ni in ri.children:
-                        note_body = (ni.text
-                                     .removeprefix('Note:')
-                                     .removeprefix('Note :')
-                                     .strip())
-                        parts.append(
-                            f'  <p style="margin-left:60px"><em>'
-                            f'<strong>Note:</strong> {esc(note_body)}'
-                            f'</em></p>')
+                    for pn in getattr(ri, 'children', []):
+                        if pn.text:
+                            parts.append(f'  <p style="margin-left:80px">{esc(pn.text)}</p>')
+                        for ni in getattr(pn, 'notes', []):
+                            note_body = (ni.text
+                                         .removeprefix('Note:')
+                                         .removeprefix('Note :')
+                                         .strip())
+                            parts_note = note_body.split('<br>')
+                            rendered = '<br>'.join(esc(p.strip()) for p in parts_note)
+                            parts.append(
+                                f'  <p style="margin-left:80px"><em>'
+                                f'<strong>Note:</strong> {rendered}'
+                                f'</em></p>')
+            for ep in getattr(item, 'epilogue', []):
+                heading_html = f'<strong><u>{esc(ep.heading)}</u></strong>'
+                if ep.content:
+                    parts.append(
+                        f'  <p style="margin-left:40px">{heading_html} {esc(ep.content)}</p>')
+                else:
+                    parts.append(
+                        f'  <p style="margin-left:40px">{heading_html}</p>')
 
         elif isinstance(item, NoteItem):
             note_body = (item.text
@@ -105,7 +146,7 @@ def _render_paragraph_block(block: ParagraphBlock, parts: list[str],
             rendered = '<br>'.join(esc(p.strip()) for p in parts_note)
             parts.append(
                 f'  <p style="margin-left:20px"><em>'
-                f'<strong>Note:</strong> {esc(note_body)}'
+                f'<strong>Note:</strong> {rendered}'
                 f'</em></p>')
 
         elif isinstance(item, PlainText):
@@ -118,10 +159,10 @@ def _render_paragraph_block(block: ParagraphBlock, parts: list[str],
                     rendered = '<br>'.join(esc(p.strip()) for p in parts_note)
                     parts.append(
                         f'  <p style="margin-left:20px"><em>'
-                        f'<strong>Note:</strong> {esc(note_body)}</em></p>')
+                        f'<strong>Note:</strong> {rendered}</em></p>')
                     continue
                 # Detect orphan letter items A) B) C) and roman numerals
-                elif re.match(r'^[A-E]\)', item.text):
+                elif re.match(r'^[A-Z]\)', item.text):
                     parts.append(
                         f'  <p style="margin-left:40px">{esc(item.text)}</p>')
                 elif re.match(r'^[ivxIVX]+\.', item.text):
@@ -149,8 +190,13 @@ def _render_node(node, parts: list[str], in_section: str = '') -> None:
         _render_header(node, parts)
 
     elif isinstance(node, IFUNode):
-        parts.append(_section_stripe('Instructions for Use'))
+        parts.append(_section_stripe(node.heading))
         parts.append(f'  <p><em>{esc(node.text)}</em></p>')
+
+    elif isinstance(node, ReferencesNode):
+        parts.append(_section_stripe(node.heading))
+        for it in node.items:
+            parts.append(f'  <p style="margin-left:20px">{esc(it.text)}</p>')
 
     elif isinstance(node, ParagraphBlockNode):
         _render_paragraph_block(node.block, parts, in_section=in_section)
@@ -172,7 +218,12 @@ def _render_node(node, parts: list[str], in_section: str = '') -> None:
             _render_node(child, parts, in_section=in_section)
 
     elif isinstance(node, TableNode):
+        if node.title:
+            parts.append(f'  <p><strong>{esc(node.title)}</strong></p>')
         parts.append(node.html)
+        if node.footnote:
+            parts.append(f'  <p style="font-size:8pt"><em>{esc(node.footnote)}</em></p>')
+        parts.append('  <p>&nbsp;</p>')
 
     elif isinstance(node, FootnoteNode):
         parts.append(
@@ -214,6 +265,7 @@ def _render_header(node: HeaderNode, parts: list[str]) -> None:
     pub_date  = meta.get('publish_date', '')
     doc_type  = meta.get('doc_type', 'Coverage Policy')
     source    = meta.get('source_url', '')
+    next_review = meta.get('next_review_date' '')
 
     parts.append(f"""<!doctype html>
 <html>
@@ -225,18 +277,13 @@ def _render_header(node: HeaderNode, parts: list[str]) -> None:
  <body>
   <h1 style="text-align:center;font-size:22pt">{esc(doc_type)}</h1>
   <p>&nbsp;</p>
-  <table id="docDetails">
-   <tbody>
-    <tr><td colspan="2"><strong>Policy Title:</strong> {esc(title)}</td></tr>
-    <tr>
-     <td><strong>Coverage Policy Number:</strong> {esc(policy_id)}</td>
-     <td><strong>Effective Date:</strong> {esc(pub_date)}</td>
-    </tr>
-   </tbody>
-  </table>
-  <p>&nbsp;</p>
-  <hr>
-  <p>&nbsp;</p>""")
+  <p><strong>Policy Title:</strong> {esc(title)}</p>
+  <p><strong>Coverage Policy Number:</strong> {esc(policy_id)}</p>
+  <p><strong>Effective Date:</strong> {esc(pub_date)}</p>""")
+    if next_review:
+        parts.append(
+            f'  <p><strong>Next Review Date:</strong> {esc(next_review)}</p>')
+    parts.append('  <p>&nbsp;</p>\n  <hr>\n  <p>&nbsp;</p>')
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -294,3 +341,4 @@ if __name__ == '__main__':
         print(f"Written: {args.out}", file=sys.stderr)
     else:
         print(html)
+
